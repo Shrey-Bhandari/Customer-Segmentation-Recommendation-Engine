@@ -310,7 +310,7 @@ if simulate_button:
         modified_scaled_vec = modified_preds and scale_row_for_features(modified_df.iloc[0])
         mod_point = pca.transform([modified_scaled_vec])[0]
         fig.add_trace(go.Scatter(x=[orig_point[0]], y=[orig_point[1]],
-                                 mode='markers', marker=dict(size=12, color='black'), name='Original'))
+                                 mode='markers', marker=dict(size=12, color='green'), name='Original'))
         fig.add_trace(go.Scatter(x=[mod_point[0]], y=[mod_point[1]],
                                  mode='markers', marker=dict(size=14, color='red'), name='Modified'))
         fig.add_trace(go.Scatter(x=[orig_point[0], mod_point[0]], y=[orig_point[1], mod_point[1]],
