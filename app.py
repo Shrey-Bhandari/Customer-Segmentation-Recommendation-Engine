@@ -1,15 +1,24 @@
 # app.py
-# Customer Strategy Simulator — Improved UI + Cluster Names + Animation
+# Customer Strategy Simulator — Enhanced with Recommendations, ML Models, Strategies, and Marketing Plan
 import streamlit as st
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LinearRegression, LogisticRegression
+from scipy.sparse import csr_matrix
 import plotly.express as px
 import plotly.graph_objects as go
 import seaborn as sns
+from sklearn.model_selection import train_test_split
 
-# ---------------------------
+# ---------- Added imports ----------
+import os
+from scipy import stats
+
+# --------------------------- 
 # Page config
 # ---------------------------
 st.set_page_config(page_title="Customer Strategy Simulator", layout="wide")
@@ -18,19 +27,35 @@ st.markdown(
     "Simulate strategy levers (spend, transactions, recency). Visualize movement in PCA space and measure Strategy Effectiveness."
 )
 
-# ---------------------------
+# --------------------------- 
 # Load data
 # ---------------------------
 @st.cache_data
-def load_df(path="customer_data_cleaned (1).csv"):
+def load_aggregated_df(path="customer_data_cleaned (1).csv"):
     df = pd.read_csv(path)
+    # Add churn label if not present (example: churn if day_since_last_purchase > 90)
+    if 'day_since_last_purchase' in df.columns:
+        df['churn'] = (df['day_since_last_purchase'] > 90).astype(int)
+    # Add CLV proxy if not present (example: total_spend * (1 + Total_Transactions / 10))
+    if 'total_spend' in df.columns and 'Total_Transactions' in df.columns:
+        df['clv'] = df['total_spend'] * (1 + df['Total_Transactions'] / 10)
     return df
 
-df = load_df()
+@st.cache_data
+def load_raw_df(path="data.csv"):
+    df = pd.read_csv(path, encoding="ISO-8859-1")
+    return df
+
+aggregated_df = load_aggregated_df()
+raw_df = load_raw_df()
+
+# Use aggregated for main app
+df = aggregated_df
+
 st.sidebar.header("Dataset Info")
 st.sidebar.write(f"Rows: {df.shape[0]} | Columns: {df.shape[1]}")
 
-# ---------------------------
+# --------------------------- 
 # Configure features & sanity checks
 # ---------------------------
 features = [
@@ -46,7 +71,7 @@ if missing:
     st.error("Missing expected feature columns: " + ", ".join(missing))
     st.stop()
 
-# ---------------------------
+# --------------------------- 
 # Cluster name mapping (for clarity)
 # ---------------------------
 cluster_name = {
@@ -62,7 +87,7 @@ cluster_colors = {
     2: "goldenrod"
 }
 
-# ---------------------------
+# --------------------------- 
 # Standardize and compute centroids
 # ---------------------------
 scaler = StandardScaler()
@@ -73,7 +98,7 @@ df_scaled['cluster'] = df['cluster'].values
 
 cluster_centroids = df_scaled.groupby('cluster').mean()
 
-# ---------------------------
+# --------------------------- 
 # PCA (2D) for visualization
 # ---------------------------
 pca = PCA(n_components=2, random_state=42)
@@ -84,27 +109,168 @@ df_pca['cluster_name'] = df_pca['cluster'].map(cluster_name)
 centroids_pca = df_pca.groupby('cluster')[['PC1', 'PC2']].mean().reset_index()
 centroids_pca['cluster_name'] = centroids_pca['cluster'].map(cluster_name)
 
+# --------------------------- 
+# Recommendation System Setup (Collaborative Filtering)
 # ---------------------------
+@st.cache_data
+def build_recommender(raw_df):
+    # Aggregate to customer-product matrix (pivot: customers x products, values = quantity)
+    customer_product = raw_df.groupby(['CustomerID', 'StockCode'])['Quantity'].sum().unstack(fill_value=0)
+    customer_product_sparse = csr_matrix(customer_product.values)
+    
+    # Cosine similarity on customer vectors
+    similarity_matrix = cosine_similarity(customer_product_sparse)
+    
+    return customer_product, similarity_matrix, customer_product.index.tolist()
+
+customer_product, similarity_matrix, customer_ids = build_recommender(raw_df)
+
+def get_recommendations(customer_id, n=5):
+    if customer_id not in customer_ids:
+        # Fallback: popular items
+        popular = raw_df.groupby('StockCode')['Quantity'].sum().nlargest(n).index.tolist()
+        rec_details = []
+        for stock in popular:
+            desc = raw_df[raw_df['StockCode'] == stock]['Description'].iloc[0] if not raw_df[raw_df['StockCode'] == stock].empty else "N/A"
+            rec_details.append({'StockCode': stock, 'Description': desc})
+        return rec_details
+    
+    cust_idx = customer_ids.index(customer_id)
+    sim_scores = list(enumerate(similarity_matrix[cust_idx]))
+    sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)[1:n+1]  # Top similar customers
+    
+    rec_products = []
+    for idx, score in sim_scores:
+        similar_cust_id = customer_ids[idx]
+        # Products bought by similar customer but not by this one
+        bought_by_sim = set(customer_product.columns[customer_product.loc[similar_cust_id] > 0])
+        bought_by_this = set(customer_product.columns[customer_product.loc[customer_id] > 0])
+        new_recs = bought_by_sim - bought_by_this
+        rec_products.extend(list(new_recs)[:3])  # Limit per similar cust
+    
+    # Unique, top-N
+    rec_products = list(set(rec_products))[:n]
+    
+    # Fetch descriptions (map back to raw_df)
+    rec_details = []
+    for stock in rec_products:
+        desc = raw_df[raw_df['StockCode'] == stock]['Description'].iloc[0] if not raw_df[raw_df['StockCode'] == stock].empty else "N/A"
+        rec_details.append({'StockCode': stock, 'Description': desc})
+    
+    return rec_details
+
+# --------------------------- 
+# Additional ML Models Setup
+# ---------------------------
+@st.cache_data
+def train_ml_models(df, X_scaled):
+    # Work on a copy to avoid modifying input df
+    local_df = df.copy()
+    
+    # Churn Prediction (Random Forest)
+    if 'churn' in local_df.columns:
+        X_train, X_test, y_train, y_test = train_test_split(X_scaled, local_df['churn'], test_size=0.2, random_state=42)
+        churn_model = RandomForestClassifier(random_state=42)
+        churn_model.fit(X_train, y_train)
+    else:
+        churn_model = None
+    
+    # CLV Regression (Linear Regression)
+    if 'clv' in local_df.columns:
+        X_train, X_test, y_train, y_test = train_test_split(X_scaled, local_df['clv'], test_size=0.2, random_state=42)
+        clv_model = LinearRegression()
+        clv_model.fit(X_train, y_train)
+    else:
+        clv_model = None
+    
+    # Uplift Modeling (Simplified: Two logistic models for control vs. treatment)
+    # Assume 'treatment' as a simulated column (e.g., random for demo; in real, from A/B test)
+    local_df['treatment'] = np.random.binomial(1, 0.5, len(local_df))  # Demo
+    local_df['response'] = np.random.binomial(1, 0.3 + 0.2 * local_df['treatment'], len(local_df))  # Demo response
+    
+    mask_control = local_df['treatment'] == 0
+    mask_treatment = local_df['treatment'] == 1
+    
+    X_control = X_scaled[mask_control]
+    y_control = local_df[mask_control]['response'].values
+    X_treatment = X_scaled[mask_treatment]
+    y_treatment = local_df[mask_treatment]['response'].values
+    
+    control_model = LogisticRegression().fit(X_control, y_control)
+    treatment_model = LogisticRegression().fit(X_treatment, y_treatment)
+    
+    return churn_model, clv_model, control_model, treatment_model
+
+churn_model, clv_model, control_model, treatment_model = train_ml_models(df, X_scaled)
+
+def uplift_score(scaled_vec):
+    if control_model is None or treatment_model is None:
+        return 0.0
+    control_prob = control_model.predict_proba([scaled_vec])[0][1]
+    treatment_prob = treatment_model.predict_proba([scaled_vec])[0][1]
+    return treatment_prob - control_prob
+
+# --------------------------- 
+# Cluster Strategies DataFrame
+# ---------------------------
+strategies_data = {
+    'Cluster': [0, 1, 2],
+    'Goal': ['Reactivate (increase txns by 50-100%, reduce recency by 30 days)', 'Increase frequency (boost txns 20-50%, avg txn value 15%)', 'Upsell premium (increase spend 20-30%, unique products +10%)'],
+    'Key Tactics': [
+        '- Discounted "welcome back" emails on past favorites (20% off first purchase).\n- SMS reminders for abandoned carts.\n- Free shipping on low-value items.',
+        '- Loyalty points for repeat buys (e.g., 2x points on next order).\n- Bundles: "Buy 2, get 1 free" on entry-level products.\n- Personalized recs via app.',
+        '- Exclusive previews: VIP access to limited-edition items.\n- Premium bundles (e.g., high-margin luxury sets at 10% off).\n- Referral bonuses: "Refer a friend, get £50 credit."'
+    ],
+    'Expected Impact (Simulate in App)': ['Moves 30-50% to Cluster 1 (via txn/recency levers).', '40% uplift to Cluster 2; simulate with txn/spend sliders.', 'Retain 80% + 10% revenue from upsells; track via monthly spend trend.'],
+    'Metrics to Track': ['Reactivation rate, first post-purchase spend.', 'Repeat purchase rate, basket size growth.', 'CLV increase, referral conversions.']
+}
+strategies_df = pd.DataFrame(strategies_data)
+
+# --------------------------- 
+# Marketing Plan Markdown
+# ---------------------------
+marketing_plan_md = """
+### Full-Scale Marketing and Advertisement Strategy (6-Month Phased Plan)
+
+**Overall Framework**:
+- **Segmentation**: Use clusters for personalization (80% of campaigns).
+- **KPIs**: CAC < £10, ROAS > 3x, 15% cluster migration rate.
+- **Tools**: Integrate with Mailchimp/Klaviyo for emails, Google Ads for search, your app for A/B testing levers.
+
+| Phase | Duration | Focus Clusters | Tactics & Channels | Budget Allocation | Expected Outcomes |
+|-------|----------|----------------|---------------------|-------------------|-------------------|
+| **1: Awareness & Reactivation** | Months 1-2 | Primarily 0 (Dormant), touch 1 | - Email: "Missed You!" series with 20% off past buys + recs (from your system).<br>- SMS: Urgency blasts ("24h flash sale").<br>- Social: Retargeting ads on X/FB for inactive users (lookalikes from Cluster 2).<br>- Content: Blog on "Rediscover Favorites" with product carousels. | 30% (£30K) – Heavy on email/SMS. | 20% reactivation in Cluster 0; 10K new engagements. |
+| **2: Engagement & Loyalty Build** | Months 2-4 | Cluster 1 (New/Low), retain 0 movers | - App/Email: Points program (e.g., "Earn £5 per £50 spent") + bundle recs.<br>- Ads: Google search for "affordable gifts" → landing with personalized quizzes (cluster-based).<br>- Influencer: Micro-influencers (10K followers) demo entry bundles on IG/TikTok.<br>- Web: Pop-ups for cart abandonment with txn incentives. | 40% (£40K) – Balanced ads/email. | 30% to Cluster 2 migration; repeat rate +25%. |
+| **3: Upsell & Retention** | Months 4-6 | Cluster 2 (High-Value), nurture 1 | - VIP Email: Exclusive drops (premium items) + CLV-based tiers (e.g., "Gold: Free upgrades").<br>- Ads: Dynamic retargeting on Amazon/FB for high-intent (e.g., "Upgrade Your Collection").<br>- Events: Virtual webinars ("Styling Tips") with upsell CTAs.<br>- Loyalty: Referral loops (share recs for credits). | 30% (£30K) – Premium channels (e.g., sponsored X posts). | 15% CLV uplift; 85% retention in Cluster 2. |
+
+**Cross-Cutting Elements**:
+- **Personalization**: 100% via recs + cluster (e.g., Cluster 0: Budget items; Cluster 2: Luxury like "VINTAGE BELLS GARLAND").
+- **A/B Testing**: Use app sliders to simulate (e.g., test 10% vs. 20% discount on uplift model).
+- **Measurement**: Weekly dashboards (Google Analytics + your app metrics). Adjust if Cluster 0 migration <20%.
+- **Risks/Mitigation**: Over-discounting erodes margins → Cap at 25%; GDPR compliance for emails.
+"""
+
+# --------------------------- 
 # Sidebar controls
 # ---------------------------
 st.sidebar.header("Simulation Controls")
 customer_id = st.sidebar.selectbox("Select CustomerID", df['CustomerID'].unique())
-spend_change = st.sidebar.slider("Change total_spend (%)", -90, 300, 0, step=5)
-txns_change = st.sidebar.slider("Change Total_Transactions (%)", -90, 300, 0, step=5)
+spend_change = st.sidebar.slider("Simulate Increased Marketing Spend (%) – Boost ad budget to encourage higher purchases & move to next cluster", -90, 300, 0, step=5)
+txns_change = st.sidebar.slider("Simulate Loyalty Incentives (%) – Promote repeat buys to increase frequency & upgrade cluster level", -90, 300, 0, step=5)
 recency_change_days = st.sidebar.slider(
-    "Change day_since_last_purchase (days, negative = more recent)", -180, 180, 0, step=1
+    "Simulate Re-engagement Campaigns (days) – Negative to pull inactive customers back (more recent) & reactivate to higher cluster", -180, 180, 0, step=1
 )
-apply_cluster_wide = st.sidebar.checkbox("Apply to entire selected customer's cluster (cluster-wide)", False)
+apply_cluster_wide = st.sidebar.checkbox("Apply Strategy to Entire Selected Customer's Cluster (Cluster-Wide Impact)", False)
 
 # Optional cascade intensity sliders (not required, default sensible)
-st.sidebar.markdown("**Cascade intensity (how changes ripple to related metrics)**")
-spend_to_avg_txn = st.sidebar.slider("Spend → Average Transaction Value multiplier", 0.0, 1.0, 0.3, step=0.05)
-txns_to_products = st.sidebar.slider("Txns → Total Products multiplier", 0.0, 1.0, 0.5, step=0.05)
-spend_to_monthly = st.sidebar.slider("Spend → Monthly Mean multiplier", 0.0, 1.0, 0.4, step=0.05)
+st.sidebar.markdown("**Ripple Effects (How changes boost related behaviors)**")
+spend_to_avg_txn = st.sidebar.slider("How much does increased spend boost average order value? (Multiplier for higher basket size)", 0.0, 1.0, 0.3, step=0.05)
+txns_to_products = st.sidebar.slider("How much do more transactions lead to diverse products? (Multiplier for cross-sell opportunities)", 0.0, 1.0, 0.5, step=0.05)
+spend_to_monthly = st.sidebar.slider("How much does spend growth stabilize monthly habits? (Multiplier for consistent revenue)", 0.0, 1.0, 0.4, step=0.05)
 
 simulate_button = st.sidebar.button("Run Simulation")
 
-# ---------------------------
+# --------------------------- 
 # Behavioral cascade function
 # ---------------------------
 def apply_behavioral_cascade(row, spend_pct, txns_pct, recency_days,
@@ -112,7 +278,8 @@ def apply_behavioral_cascade(row, spend_pct, txns_pct, recency_days,
     modified = row.copy().astype(float)
     modified['total_spend'] = modified['total_spend'] * (1 + spend_pct / 100)
     modified['Total_Transactions'] = modified['Total_Transactions'] * (1 + txns_pct / 100)
-    modified['day_since_last_purchase'] = max(0, modified['day_since_last_purchase'] + recency_days)
+    if 'day_since_last_purchase' in modified.index:
+        modified['day_since_last_purchase'] = max(0, modified['day_since_last_purchase'] + recency_days)
     # propagate to average txn value
     if modified['Total_Transactions'] > 0:
         modified['Average_Transaction_Value'] = modified['total_spend'] / max(1, modified['Total_Transactions'])
@@ -127,7 +294,7 @@ def apply_behavioral_cascade(row, spend_pct, txns_pct, recency_days,
         modified['Cancellation_Rate'] = max(0, modified['Cancellation_Rate'] * (1 - 0.1 * (spend_pct/100 + txns_pct/100)))
     return modified
 
-# ---------------------------
+# --------------------------- 
 # Utility functions
 # ---------------------------
 def predict_cluster_and_distances_from_scaled_vector(scaled_vec):
@@ -144,7 +311,7 @@ def scale_row_for_features(row):
     vals = [row[f] if f in row.index else df[f].mean() for f in features]
     return scaler.transform([vals])[0]
 
-# ---------------------------
+# --------------------------- 
 # Show high-level cluster summary cards
 # ---------------------------
 st.subheader("Cluster Overview (at a glance)")
@@ -163,7 +330,48 @@ for i, c in enumerate(sorted(df['cluster'].unique())):
 
 st.markdown("---")
 
+# --------------------------- 
+# Personalized Recommendations
 # ---------------------------
+st.subheader("Personalized Recommendations")
+recs = get_recommendations(customer_id, n=5)
+if recs:
+    rec_df = pd.DataFrame(recs)
+    st.dataframe(rec_df, use_container_width=True)
+    st.write(f"Based on similar customers to ID {customer_id}. Encourage upsell with these!")
+else:
+    st.info("No recommendations available—customer has unique profile.")
+
+# --------------------------- 
+# Additional ML Predictions (Tabs)
+# ---------------------------
+tab1, tab2, tab3 = st.tabs(["Churn Risk", "CLV Forecast", "Uplift Score"])
+cust_idx = df[df['CustomerID'] == customer_id].index[0]
+orig_scaled_vec = df_scaled.loc[cust_idx, features].values
+
+with tab1:
+    if churn_model:
+        churn_prob = churn_model.predict_proba([orig_scaled_vec])[0][1]
+        st.metric("Churn Probability", f"{churn_prob:.2%}")
+        if churn_prob > 0.5:
+            st.warning("High churn risk—prioritize retention tactics.")
+    else:
+        st.info("Churn model not available (add 'churn' column).")
+
+with tab2:
+    if clv_model:
+        clv_pred = clv_model.predict([orig_scaled_vec])[0]
+        st.metric("Projected CLV", f"£{clv_pred:,.2f}")
+    else:
+        st.info("CLV model not available (add 'clv' column).")
+
+with tab3:
+    uplift = uplift_score(orig_scaled_vec)
+    st.metric("Uplift Score (Treatment Effect)", f"{uplift:.2%}")
+    if uplift > 0.1:
+        st.success("High potential uplift—target with campaigns.")
+
+# --------------------------- 
 # Run simulation when requested
 # ---------------------------
 if simulate_button:
@@ -179,14 +387,16 @@ if simulate_button:
     cust_spend = orig_row['total_spend']
     cust_txns = orig_row['Total_Transactions']
     cust_products = orig_row['Total_Products_Purchased']
-    cust_recency = orig_row['day_since_last_purchase']
+    if 'day_since_last_purchase' in orig_row.index:
+        cust_recency = orig_row['day_since_last_purchase']
     cust_monthly_mean = orig_row['Monthly_Spending_Mean']
 
     # Dataset-level averages for normalization
     avg_spend = df['total_spend'].mean()
     avg_txns = df['Total_Transactions'].mean()
     avg_products = df['Total_Products_Purchased'].mean()
-    avg_recency = df['day_since_last_purchase'].mean()
+    if 'day_since_last_purchase' in df.columns:
+        avg_recency = df['day_since_last_purchase'].mean()
     avg_monthly_mean = df['Monthly_Spending_Mean'].mean()
 
     # Derived behavioral indicators (non-synthetic)
@@ -203,10 +413,10 @@ if simulate_button:
     )
 
     # Recency-adjusted monthly spending intensity
-    spend_to_monthly = (
-        orig_row['total_spend'] / ((orig_row['day_since_last_purchase'] / 30) + 1)
-    )
-
+    if 'day_since_last_purchase' in orig_row.index:
+        spend_to_monthly = (
+            orig_row['total_spend'] / ((orig_row['day_since_last_purchase'] / 30) + 1)
+        )
 
     # Build modified rows
     if apply_cluster_wide:
@@ -270,7 +480,7 @@ if simulate_button:
         moves = (orig_clusters != new_clusters).sum()
         st.write(f"{moves} / {len(orig_clusters)} customers ({(moves / len(orig_clusters) * 100):.2f}%) changed cluster.")
 
-    # ---------------------------
+    # --------------------------- 
     # PCA movement animation (interactive)
     # ---------------------------
     st.header("PCA Movement (Interactive)")
@@ -307,7 +517,7 @@ if simulate_button:
                                      line=dict(color='gray', width=1), hoverinfo='none', showlegend=False))
     else:
         orig_point = pca.transform([orig_scaled_vec])[0]
-        modified_scaled_vec = modified_preds and scale_row_for_features(modified_df.iloc[0])
+        modified_scaled_vec = scale_row_for_features(modified_df.iloc[0])
         mod_point = pca.transform([modified_scaled_vec])[0]
         fig.add_trace(go.Scatter(x=[orig_point[0]], y=[orig_point[1]],
                                  mode='markers', marker=dict(size=12, color='green'), name='Original'))
@@ -318,6 +528,16 @@ if simulate_button:
 
     fig.update_layout(height=600, legend_title_text="Cluster")
     st.plotly_chart(fig, use_container_width=True)
+
+    # Post-Simulation Recommendations
+    st.subheader("Post-Simulation Recommendations")
+    # Simulate updated row for recs (use modified_df.iloc[0])
+    updated_recs = get_recommendations(customer_id, n=5)  # Re-run (in real, adjust matrix)
+    if updated_recs:
+        updated_rec_df = pd.DataFrame(updated_recs)
+        st.dataframe(updated_rec_df, use_container_width=True)
+    else:
+        st.info("No updated recommendations.")
 
     # Interpretation section
     st.markdown("---")
@@ -340,4 +560,205 @@ if simulate_button:
             "- Ideal for high-level strategy (e.g., loyalty campaigns, targeted incentives)."
         )
 
+# --------------------------- 
+# Tailored Strategies Expander
+# ---------------------------
+with st.expander("View Tailored Strategies"):
+    cluster = int(df[df['CustomerID'] == customer_id]['cluster'].iloc[0])
+    st.subheader(f"Strategies for {cluster_name.get(cluster, f'Cluster {cluster}')}")
+    filtered_strategies = strategies_df[strategies_df['Cluster'] == cluster]
+    st.table(filtered_strategies)
 
+# --------------------------- 
+# Marketing Plan Expander
+# ---------------------------
+with st.expander("Full Marketing & Advertisement Strategy"):
+    st.markdown(marketing_plan_md)
+
+# ---------- New helper: A/B testing simulator ----------
+def ab_test_simulation(base_row, variant_a, variant_b, n_boot=200):
+    """
+    base_row: pd.Series original customer row
+    variant_a/b: dict with keys spend_pct, txns_pct, recency_days
+    Returns summary dict with mean uplift estimates and p-value (bootstrap).
+    """
+    # Apply deterministic change to get point estimates
+    a_row = apply_behavioral_cascade(base_row, variant_a['spend_pct'], variant_a['txns_pct'], variant_a['recency_days'],
+                                     spend_to_avg=variant_a.get('spend_to_avg', 0.3),
+                                     txns_to_prod=variant_a.get('txns_to_products', 0.5),
+                                     spend_to_monthly=variant_a.get('spend_to_monthly', 0.4))
+    b_row = apply_behavioral_cascade(base_row, variant_b['spend_pct'], variant_b['txns_pct'], variant_b['recency_days'],
+                                     spend_to_avg=variant_b.get('spend_to_avg', 0.3),
+                                     txns_to_prod=variant_b.get('txns_to_products', 0.5),
+                                     spend_to_monthly=variant_b.get('spend_to_monthly', 0.4))
+    # Scale for model input
+    a_scaled = scale_row_for_features(a_row)
+    b_scaled = scale_row_for_features(b_row)
+    base_scaled = scale_row_for_features(base_row)
+    # Use uplift_score (treatment vs control model) if available, else fallback to churn probability delta
+    def estimate_effect(scaled_vec):
+        try:
+            return uplift_score(scaled_vec)
+        except Exception:
+            # fallback: difference in churn risk (negative uplift = lower churn -> better)
+            if churn_model is not None:
+                return - (churn_model.predict_proba([scaled_vec])[0][1])
+            return 0.0
+
+    est_base = estimate_effect(base_scaled)
+    est_a = estimate_effect(a_scaled)
+    est_b = estimate_effect(b_scaled)
+
+    # Bootstrap synth noise around scaled vector to compute distribution
+    rng = np.random.default_rng(42)
+    a_samps = []
+    b_samps = []
+    for _ in range(n_boot):
+        jitter = rng.normal(scale=0.02, size=len(a_scaled))  # small noise
+        a_val = estimate_effect(a_scaled + jitter)
+        jitter = rng.normal(scale=0.02, size=len(b_scaled))
+        b_val = estimate_effect(b_scaled + jitter)
+        a_samps.append(a_val)
+        b_samps.append(b_val)
+
+    # t-test
+    try:
+        tstat, pval = stats.ttest_ind(a_samps, b_samps, equal_var=False)
+    except Exception:
+        pval = 1.0
+
+    summary = {
+        'base': est_base,
+        'variant_a': est_a,
+        'variant_b': est_b,
+        'a_samples_mean': np.mean(a_samps),
+        'b_samples_mean': np.mean(b_samps),
+        'p_value': float(pval)
+    }
+    return summary
+
+# ---------- New helper: Cohort builder ----------
+def build_cohort_table(raw_df, aggregated_df, date_col='InvoiceDate'):
+    """
+    Constructs a cohort-month vs current cluster table (percentage distribution).
+    Expects raw_df with InvoiceDate and CustomerID; aggregated_df with CustomerID and cluster.
+    Returns pivot_df (cohort_month x cluster) as percentage.
+    """
+    if date_col not in raw_df.columns or 'CustomerID' not in raw_df.columns:
+        return None
+    try:
+        tmp = raw_df.copy()
+        tmp[date_col] = pd.to_datetime(tmp[date_col], errors='coerce')
+        first_purchase = tmp.groupby('CustomerID')[date_col].min().dropna().to_frame('first_date')
+        first_purchase['cohort_month'] = first_purchase['first_date'].dt.to_period('M').astype(str)
+        merged = first_purchase.merge(aggregated_df[['CustomerID', 'cluster']], left_index=True, right_on='CustomerID', how='left')
+        pivot = pd.crosstab(merged['cohort_month'], merged['cluster'], normalize='index') * 100
+        pivot = pivot.sort_index()
+        return pivot
+    except Exception:
+        return None
+
+# ---------- New helper: GenAI-style summary (local fallback) ----------
+def generate_ai_insights(sim_summary, target_customer_id, use_external=False):
+    """
+    Returns a concise narrative insight. If use_external True and GEMINI_API_KEY present,
+    you may implement an external call (not provided here). This function provides local auto-generated text.
+    """
+    if sim_summary is None:
+        return "No simulation run yet to summarize."
+    base = sim_summary.get('base')
+    a = sim_summary.get('variant_a')
+    b = sim_summary.get('variant_b')
+    p = sim_summary.get('p_value', None)
+    lines = []
+    lines.append(f"Customer {target_customer_id} — Quick AI Summary:")
+    lines.append(f"- Baseline estimated uplift: {base:.2%}")
+    lines.append(f"- Variant A estimated uplift: {a:.2%}")
+    lines.append(f"- Variant B estimated uplift: {b:.2%}")
+    if p is not None:
+        lines.append(f"- Comparative p-value (A vs B): {p:.4f}")
+        if p < 0.05:
+            lines.append("- Result: Statistically significant difference — prefer the better-performing variant.")
+        else:
+            lines.append("- Result: No statistically significant difference — consider larger sample or stronger levers.")
+    # Recommendation heuristic
+    better = 'A' if sim_summary.get('variant_a', 0) > sim_summary.get('variant_b', 0) else 'B'
+    lines.append(f"- Recommendation: Run a controlled A/B test at scale on {better} (pilot n=1k customers) and monitor CLV + churn.")
+    return "\n".join(lines)
+
+# ---------- Inserted UI: A/B Test Simulator expander ----------
+with st.expander("A/B Test Simulator"):
+    st.write("Compare two variants (e.g., discount vs. loyalty) using your uplift model. Uses the selected customer as a template.")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.write("Variant A - Quick inputs")
+        a_spend = st.number_input("A: Spend % change", value=10, step=1)
+        a_txns = st.number_input("A: Txns % change", value=10, step=1)
+        a_recency = st.number_input("A: Recency days change", value=-14, step=1)
+    with col2:
+        st.write("Variant B - Quick inputs")
+        b_spend = st.number_input("B: Spend % change", value=0, step=1)
+        b_txns = st.number_input("B: Txns % change", value=20, step=1)
+        b_recency = st.number_input("B: Recency days change", value=-7, step=1)
+    ab_boot = st.slider("Bootstrap samples (quality vs speed)", 50, 1000, 200, step=50)
+
+    run_ab = st.button("Run A/B Simulation")
+    last_ab_summary = None
+    if run_ab:
+        # get customer row
+        if customer_id not in df['CustomerID'].values:
+            st.error("Selected customer not found for A/B simulation.")
+        else:
+            idx = df[df['CustomerID'] == customer_id].index[0]
+            base_row = df.loc[idx]
+            variant_a = {'spend_pct': a_spend, 'txns_pct': a_txns, 'recency_days': a_recency}
+            variant_b = {'spend_pct': b_spend, 'txns_pct': b_txns, 'recency_days': b_recency}
+            with st.spinner("Simulating variants..."):
+                summary = ab_test_simulation(base_row, variant_a, variant_b, n_boot=ab_boot)
+                last_ab_summary = summary
+            # Visualize
+            bars = pd.DataFrame({
+                'Scenario': ['Baseline', 'Variant A', 'Variant B'],
+                'Estimated Uplift': [summary['base'], summary['variant_a'], summary['variant_b']]
+            })
+            fig_ab = px.bar(bars, x='Scenario', y='Estimated Uplift', color='Scenario', text='Estimated Uplift',
+                            labels={'Estimated Uplift': 'Estimated Uplift (treatment effect)'},
+                            title='A/B Estimated Uplift Comparison')
+            fig_ab.update_traces(texttemplate='%{text:.2%}', textposition='outside')
+            st.plotly_chart(fig_ab, use_container_width=True)
+            st.write(f"P-value (A vs B): {summary['p_value']:.4f}")
+            if summary['p_value'] < 0.05:
+                st.success("Significant difference detected between variants.")
+            else:
+                st.info("No significant difference detected. Consider larger n or stronger levers.")
+            # store for AI insights section
+            st.session_state['last_ab_summary'] = summary
+
+# ---------- Inserted UI: Dynamic Cohort Analysis ----------
+with st.expander("Dynamic Cohort Analysis"):
+    st.write("Cohort month (first purchase) vs current cluster distribution. Useful to spot retention / migration patterns.")
+    cohort_tbl = build_cohort_table(raw_df, df, date_col='InvoiceDate' if 'InvoiceDate' in raw_df.columns else 'InvoiceDate')
+    if cohort_tbl is None or cohort_tbl.empty:
+        st.info("Cohort analysis not available: raw transaction date column 'InvoiceDate' or CustomerID may be missing or unparsable in raw_df.")
+    else:
+        st.write("Heatmap: % customers in each cluster per cohort month (rows = cohort month).")
+        fig_cohort = px.imshow(cohort_tbl.fillna(0).T, labels=dict(x="Cohort Month", y="Cluster", color="% of cohort"), aspect="auto",
+                               title="Cohort -> Current Cluster Distribution (%)")
+        st.plotly_chart(fig_cohort, use_container_width=True)
+        st.dataframe(cohort_tbl.round(2))
+
+# ---------- Inserted UI: GenAI-Powered Insights (local fallback) ----------
+with st.expander("GenAI-Powered Insights (Auto Summary)"):
+    st.write("Auto-generated narratives for the last A/B simulation or the last run simulation. External GenAI can be enabled via GEMINI_API_KEY env var (do NOT paste keys into the app).")
+    sim_summary = st.session_state.get('last_ab_summary', None)
+    if sim_summary is None:
+        st.info("Run the A/B Simulator to generate insights, or run the main simulation and use the interpretation pane.")
+    else:
+        use_external = False
+        api_key = os.getenv('GEMINI_API_KEY')
+        if api_key:
+            st.write("External GenAI key detected in environment — external summarization can be enabled (not automatic in this demo).")
+            # For safety we do not auto-call external services here; keep local summary for now.
+            use_external = False
+        insight_text = generate_ai_insights(sim_summary, customer_id, use_external=use_external)
+        st.text_area("AI Summary", value=insight_text, height=220)
