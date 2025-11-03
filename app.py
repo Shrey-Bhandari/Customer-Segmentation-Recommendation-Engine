@@ -253,22 +253,57 @@ marketing_plan_md = """
 # --------------------------- 
 # Sidebar controls
 # ---------------------------
-st.sidebar.header("Simulation Controls")
-customer_id = st.sidebar.selectbox("Select CustomerID", df['CustomerID'].unique())
-spend_change = st.sidebar.slider("Simulate Increased Marketing Spend (%) – Boost ad budget to encourage higher purchases & move to next cluster", -90, 300, 0, step=5)
-txns_change = st.sidebar.slider("Simulate Loyalty Incentives (%) – Promote repeat buys to increase frequency & upgrade cluster level", -90, 300, 0, step=5)
-recency_change_days = st.sidebar.slider(
-    "Simulate Re-engagement Campaigns (days) – Negative to pull inactive customers back (more recent) & reactivate to higher cluster", -180, 180, 0, step=1
+st.sidebar.header("Customer Strategy Controls")
+
+# Core customer selection
+customer_id = st.sidebar.selectbox("📊 Select Customer", df['CustomerID'].unique())
+
+# Main strategy levers
+st.sidebar.subheader("Strategy Levers")
+spend_change = st.sidebar.slider(
+    "Marketing Spend", 
+    -90, 300, 0, step=5,
+    help="Adjust marketing spend to influence purchase behavior"
 )
-apply_cluster_wide = st.sidebar.checkbox("Apply Strategy to Entire Selected Customer's Cluster (Cluster-Wide Impact)", False)
+txns_change = st.sidebar.slider(
+    "Loyalty Program", 
+    -90, 300, 0, step=5,
+    help="Modify loyalty incentives to boost repeat purchases"
+)
+recency_change_days = st.sidebar.slider(
+    "Re-engagement Days", 
+    -180, 180, 0, step=1,
+    help="Negative days = pull customers back sooner"
+)
 
-# Optional cascade intensity sliders (not required, default sensible)
-st.sidebar.markdown("**Ripple Effects (How changes boost related behaviors)**")
-spend_to_avg_txn = st.sidebar.slider("How much does increased spend boost average order value? (Multiplier for higher basket size)", 0.0, 1.0, 0.3, step=0.05)
-txns_to_products = st.sidebar.slider("How much do more transactions lead to diverse products? (Multiplier for cross-sell opportunities)", 0.0, 1.0, 0.5, step=0.05)
-spend_to_monthly = st.sidebar.slider("How much does spend growth stabilize monthly habits? (Multiplier for consistent revenue)", 0.0, 1.0, 0.4, step=0.05)
+# Cluster-wide toggle
+apply_cluster_wide = st.sidebar.checkbox(
+    "Apply to Entire Segment", 
+    False,
+    help="Test strategy on all customers in the same cluster"
+)
 
-simulate_button = st.sidebar.button("Run Simulation")
+# Advanced settings
+st.sidebar.subheader("Advanced Settings")
+st.sidebar.markdown("**    Behavior Multipliers**")
+spend_to_avg_txn = st.sidebar.slider(
+    "Order Value Impact", 
+    0.0, 1.0, 0.3, step=0.05,
+    help="How much spend increase affects average order value"
+)
+txns_to_products = st.sidebar.slider(
+    "Cross-Sell Effect", 
+    0.0, 1.0, 0.5, step=0.05,
+    help="How transactions lead to product diversity"
+)
+spend_to_monthly = st.sidebar.slider(
+    "Monthly Stability", 
+    0.0, 1.0, 0.4, step=0.05,
+    help="Impact on consistent monthly spending"
+)
+
+# Run simulation button with clear call-to-action
+simulate_button = st.sidebar.button("Run Strategy Simulation", type="primary")
 
 # --------------------------- 
 # Behavioral cascade function
@@ -302,10 +337,45 @@ def predict_cluster_and_distances_from_scaled_vector(scaled_vec):
     nearest = int(distances.idxmin())
     return nearest, distances.to_dict()
 
-def effectiveness_score(dist_before, dist_after):
-    if dist_before <= 0:
-        return 0.0
-    return float((dist_before - dist_after) / dist_before * 100)
+def effectiveness_score(dist_before, dist_after, orig_cluster, new_cluster):
+    """
+    Enhanced effectiveness score that prioritizes:
+    1. Cluster upgrades (major positive impact)
+    2. Distance improvement within same cluster (minor positive impact)
+    3. Cluster downgrades (negative impact)
+    
+    Returns score between -100 and 100:
+    - Positive: Better cluster or closer to better centroid
+    - Negative: Worse cluster or further from ideal centroid
+    """
+    # Cluster movement impact (primary factor)
+    cluster_diff = new_cluster - orig_cluster
+    
+    # Base score from cluster movement
+    if cluster_diff > 0:  # Upgrade
+        cluster_score = 50 * cluster_diff  # +50 per cluster upgrade
+    elif cluster_diff < 0:  # Downgrade
+        cluster_score = 60 * cluster_diff  # -60 per cluster downgrade
+    else:  # Same cluster
+        cluster_score = 0
+    
+    # Distance component (secondary factor)
+    # For upgrades: distance to new centroid matters more than distance improvement
+    if cluster_diff > 0:
+        # When upgrading, we care more about being close to new cluster
+        dist_score = 20 * (1 - dist_after / (dist_before + 1e-6))
+    else:
+        # When same/downgrade, we care about relative improvement
+        dist_score = 30 * ((dist_before - dist_after) / (dist_before + 1e-6))
+    
+    # Combine scores
+    final_score = cluster_score + dist_score
+    
+    # Ensure upgrades are always positive
+    if cluster_diff > 0:
+        final_score = max(20, final_score)  # Minimum 20% score for any upgrade
+        
+    return max(-100, min(100, final_score))
 
 def scale_row_for_features(row):
     vals = [row[f] if f in row.index else df[f].mean() for f in features]
@@ -361,7 +431,7 @@ with tab1:
 with tab2:
     if clv_model:
         clv_pred = clv_model.predict([orig_scaled_vec])[0]
-        st.metric("Projected CLV", f"£{clv_pred:,.2f}")
+        st.metric("Projected CLV", f"₹{clv_pred:,.2f}")
     else:
         st.info("CLV model not available (add 'clv' column).")
 
@@ -453,22 +523,93 @@ if simulate_button:
         new_pred = modified_preds[0][1]
         new_dists = modified_dist_dicts[0]
         new_nearest_dist = min(new_dists.values())
-        eff = effectiveness_score(orig_nearest_dist, new_nearest_dist)
+        
+        # Calculate effectiveness
+        eff = effectiveness_score(
+            orig_nearest_dist,
+            new_nearest_dist,
+            int(orig_row['cluster']),
+            new_pred
+        )
 
+        # Display metrics
         col_a, col_b, col_c = st.columns(3)
         col_a.metric("Original Cluster", f"{int(orig_row['cluster'])}")
         col_b.metric("New Cluster (Predicted)", f"{int(new_pred)}")
-        col_c.metric("Strategy Effectiveness", f"{eff:.2f}%")
-        if new_pred != int(orig_row['cluster']):
-            st.success("Customer moved to a different segment after the simulated changes.")
-        else:
-            st.info("Customer remained in the same segment after the simulated changes.")
+        
+        # Add delta indicator for cluster movement
+        delta = new_pred - int(orig_row['cluster'])
+        col_c.metric("Strategy Effectiveness", 
+                     f"{eff:.1f}%",
+                     delta=f"{'+' if delta > 0 else ''}{delta} clusters" if delta != 0 else "Same cluster")
 
-        # Distance tables
-        st.markdown("**Distances to Centroids (Before)**")
-        st.dataframe(pd.Series(orig_distances).rename("distance_before").sort_values().to_frame())
-        st.markdown("**Distances to Centroids (After)**")
-        st.dataframe(pd.Series(new_dists).rename("distance_after").sort_values().to_frame())
+        # Enhanced movement interpretation
+        st.markdown("### Strategy Impact Analysis")
+        
+        if new_pred != int(orig_row['cluster']):
+            if new_pred > int(orig_row['cluster']):
+                st.success(f"🎯 Cluster Upgrade: {cluster_name[int(orig_row['cluster'])]} → {cluster_name[new_pred]}")
+                
+                value_increase = (new_pred - int(orig_row['cluster'])) * 25
+                st.markdown(f"""
+                ### Positive Movement Analysis
+                - **Cluster Improvement**: +{new_pred - int(orig_row['cluster'])} levels
+                - **Expected Value Increase**: ~{value_increase}%
+                - **Distance Quality**: {' Good' if new_nearest_dist < orig_nearest_dist else ' Needs Optimization'} fit to new cluster
+                
+                **Next Steps:**
+                1. Apply retention strategies for {cluster_name[new_pred]}
+                2. Monitor for stability in new segment
+                3. Consider additional uplift opportunities
+                """)
+                
+            else:
+                st.warning(f"⚠️ Cluster Downgrade: {cluster_name[int(orig_row['cluster'])]} → {cluster_name[new_pred]}")
+                st.markdown(f"""
+                ### Movement Analysis (Caution)
+                - **Cluster Change**: {new_pred - int(orig_row['cluster'])} levels
+                - **Risk Level**: High - Immediate attention needed
+                - **Recovery Plan**: Review strategy recommendations below
+                """)
+        else:
+            next_cluster = min(2, int(orig_row['cluster']) + 1)
+            progress = ((orig_distances[next_cluster] - new_dists[next_cluster]) / orig_distances[next_cluster] * 100)
+            
+            if progress > 0:
+                st.info(f"📈 Progress: {progress:.1f}% closer to next cluster upgrade")
+            else:
+                st.info("⚖️ Stable within current cluster")
+    
+        # Updated effectiveness interpretation
+        st.markdown("### Strategy Effectiveness Analysis")
+        if eff > 50:
+            st.success(f"""
+            🌟 **Outstanding Results** (Score: {eff:.1f}%)
+            - Strong cluster upgrade achieved
+            - Good positioning within new segment
+            - Ready for advanced strategies
+            """)
+        elif eff > 25:
+            st.success(f"""
+            ✨ **Positive Impact** (Score: {eff:.1f}%)
+            - Clear improvement demonstrated
+            - Good strategic direction
+            - Continue current approach
+            """)
+        elif eff > 0:
+            st.info(f"""
+            📊 **Moderate Progress** (Score: {eff:.1f}%)
+            - Some positive movement detected
+            - Consider strengthening interventions
+            - Review strategy mix
+            """)
+        else:
+            st.warning(f"""
+            ⚠️ **Strategy Alert** (Score: {eff:.1f}%)
+            - Movement not optimal
+            - Review customer profile
+            - Consider alternative approaches
+            """)
 
     else:
         orig_clusters = df_scaled.loc[modified_df.index, 'cluster'].values
@@ -589,7 +730,7 @@ def ab_test_simulation(base_row, variant_a, variant_b, n_boot=200):
                                      spend_to_monthly=variant_a.get('spend_to_monthly', 0.4))
     b_row = apply_behavioral_cascade(base_row, variant_b['spend_pct'], variant_b['txns_pct'], variant_b['recency_days'],
                                      spend_to_avg=variant_b.get('spend_to_avg', 0.3),
-                                     txns_to_prod=variant_b.get('txns_to_products', 0.5),
+                                     txns_to_prod=variant_b.get('spend_to_products', 0.5),
                                      spend_to_monthly=variant_b.get('spend_to_monthly', 0.4))
     # Scale for model input
     a_scaled = scale_row_for_features(a_row)
